@@ -6,6 +6,21 @@
 #include "proc.h"
 #include "defs.h"
 #include "kalloc.h"
+const uint64 weight[40] = {
+  88761, 71755, 56483, 46273, 36291,
+  29154, 23254, 18705, 14949, 11916,
+  9548, 7620, 6100, 4904, 3906,
+  3121, 2501, 1991, 1586, 1277,
+  1024, 820, 655, 526, 423,
+  335, 272, 215, 172, 137,
+  110, 87, 70, 56, 45,
+  36, 29, 23, 18, 15
+};
+
+struct spinlock rq_lock;
+uint64 rq_weighted_diff = 0;  // sigma((vi - v0) * wi)
+uint64 rq_min_vrun = 0;  // minimum vruntime of the runqueue
+uint64 rq_weight_sum = 0; // sigma(wi)
 
 struct cpu cpus[NCPU];
 
@@ -44,6 +59,100 @@ proc_mapstacks(pagetable_t kpgtbl)
   }
 }
 
+//  run queue에 프로세스 p를 추가
+static void
+rq_add(struct proc *p)
+{
+  acquire(&rq_lock);
+
+  if (rq_weight_sum == 0 || p->vruntime < rq_min_vrun) {  // 새로운 min_vrun
+    rq_min_vrun = p->vruntime;
+    rq_weighted_diff = 0;
+
+    struct proc *q;
+    for (q = proc; q < &proc[NPROC]; q++) {
+      if (q->state == RUNNABLE || q->state == RUNNING) {
+        rq_weighted_diff += (q->vruntime - rq_min_vrun) * q->weight;
+      }
+    }
+  } else {  // 그냥 큐에 추가만 하는 경우
+    rq_weighted_diff += (p->vruntime - rq_min_vrun) * p->weight;
+  }
+
+  rq_weight_sum += p->weight;
+  release(&rq_lock);
+}
+
+//  run queue에서 프로세스 p를 제거
+static void
+rq_remove(struct proc *p)
+{
+  acquire(&rq_lock);
+
+  rq_weight_sum -= p->weight;
+  rq_weighted_diff -= (p->vruntime - rq_min_vrun) * p->weight;
+
+  if (rq_weight_sum == 0) {
+    rq_min_vrun = 0;
+    rq_weighted_diff = 0;
+  }
+  else if (p->vruntime == rq_min_vrun) {  //  min_vrun이 제거된 경우
+    struct proc *q;
+    rq_min_vrun = (uint64)-1; //UINT64_MAX
+    for (q = proc; q < &proc[NPROC]; q++) {
+      if ((q->state == RUNNABLE || q->state == RUNNING) && q != p) {
+        if (q->vruntime < rq_min_vrun) {
+          rq_min_vrun = q->vruntime;
+        }
+      }
+    }
+
+    rq_weighted_diff = 0;
+    for (q = proc; q < &proc[NPROC]; q++) {
+      if (q->state == RUNNABLE || q->state == RUNNING) {
+        rq_weighted_diff += (q->vruntime - rq_min_vrun) * q->weight;
+      }
+    }
+  }
+
+  release(&rq_lock);
+}
+
+//  부팅 완료 후 1회만 연산
+static void
+rq_init(void)
+{
+  rq_weight_sum = 0;
+  rq_min_vrun = (uint64)-1; //UINT64_MAX
+  rq_weighted_diff = 0;
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    if (p->state == RUNNABLE || p->state == RUNNING) {
+      if (p->vruntime < rq_min_vrun) {
+        rq_min_vrun = p->vruntime;
+      }
+    }
+  }
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    if ((p->state == RUNNABLE || p->state == RUNNING) && p->weight != 0) {
+      rq_weight_sum += p->weight;
+      rq_weighted_diff += (p->vruntime - rq_min_vrun) * p->weight;
+    }
+  }
+}
+
+//  eligibility 체크
+static inline int
+is_eligible(struct proc *p)
+{
+  acquire(&rq_lock);
+  int eligible = (rq_weighted_diff >= (p->vruntime - rq_min_vrun) * rq_weight_sum);
+  release(&rq_lock);
+  return eligible;
+}
+
 // initialize the proc table.
 void
 procinit(void)
@@ -52,6 +161,8 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&rq_lock, "rq_lock");
+
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
@@ -127,6 +238,11 @@ found:
   p->state = USED;
 
   p->nice = DEFAULT_NICE; // 초기 nice 값을 기본값 20으로 설정
+  p->weight = weight[DEFAULT_NICE]; // 초기 weight 값을 기본값으로 설정
+  p->vruntime = 0;
+  p->vdeadline = (weight[DEFAULT_NICE] * DEFAULT_TIME_SLICE) / p->weight;
+  p->runtime = 0;
+  p->timeslice = DEFAULT_TIME_SLICE; // 초기 time slice 값을 기본값으로 설정
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -253,8 +369,11 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+  rq_add(p); // run queue에 추가
 
   release(&p->lock);
+
+  rq_init(); // run queue initialization
 }
 
 // Grow or shrink user memory by n bytes.
@@ -322,7 +441,15 @@ fork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  np->nice = p->nice;
+  np->weight = weight[p->nice];
+  np->vruntime = p->vruntime;
+  np->runtime = 0;
+  np->timeslice = DEFAULT_TIME_SLICE;
+  np->vdeadline = np->vruntime + (weight[DEFAULT_NICE] * DEFAULT_TIME_SLICE) / np->weight;
+
   np->state = RUNNABLE;
+  rq_add(np); // run queue에 추가
   release(&np->lock);
 
   return pid;
@@ -379,6 +506,7 @@ exit(int status)
   acquire(&p->lock);
 
   p->xstate = status;
+  rq_remove(p); // run queue에서 제거
   p->state = ZOMBIE;
 
   release(&wait_lock);
@@ -457,26 +585,35 @@ scheduler(void)
     // processes are waiting.
     intr_on();
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    uint64 min_vdeadline = (uint64)-1; //UINT64_MAX
+    struct proc *selected_p = 0;
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && is_eligible(p)) {
+        if (selected_p == 0 || p->vdeadline < min_vdeadline) {
+          if (selected_p) { // 기존 min_vdeadline보다 현재 프로세스의 vdeadline이 더 작을 경우
+            release(&selected_p->lock); // 이전 후보 프로세스의 lock 해제
+          }
+          selected_p = p;
+          min_vdeadline = p->vdeadline;
+          continue;
+        }
       }
       release(&p->lock);
     }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    
+    if (selected_p) {
+      rq_remove(selected_p); // run queue에서 제거
+      selected_p->state = RUNNING;
+      selected_p->timeslice = DEFAULT_TIME_SLICE;
+      c->proc = selected_p;
+
+      swtch(&c->context, &selected_p->context);
+      c->proc = 0;
+      release(&selected_p->lock);
+    }
+    else {
       intr_on();
       asm volatile("wfi");
     }
@@ -517,6 +654,8 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  p->vdeadline = p->vruntime + (weight[DEFAULT_NICE] * DEFAULT_TIME_SLICE) / p->weight;
+  rq_add(p); // run queue에 다시 추가
   sched();
   release(&p->lock);
 }
@@ -560,6 +699,7 @@ sleep(void *chan, struct spinlock *lk)
   // so it's okay to release lk.
 
   acquire(&p->lock);  //DOC: sleeplock1
+  rq_remove(p); // run queue에서 제거
   release(lk);
 
   // Go to sleep.
@@ -588,6 +728,9 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        p->timeslice = DEFAULT_TIME_SLICE;
+        p->vdeadline = p->vruntime + (weight[DEFAULT_NICE] * DEFAULT_TIME_SLICE) / p->weight;
+        rq_add(p); // run queue에 추가
       }
       release(&p->lock);
     }
@@ -726,6 +869,8 @@ setnice(int pid, int value)
     acquire(&p->lock);
     if (p->pid == pid && p->state != UNUSED) {
       p->nice = value;
+      p->weight = weight[value]; // nice 값에 따라 weight 업데이트
+      p->vdeadline = p->vruntime + (weight[DEFAULT_NICE] * DEFAULT_TIME_SLICE) / p->weight; // vdeadline 업데이트
       release(&p->lock);
       return 0;
     }
@@ -735,6 +880,31 @@ setnice(int pid, int value)
   return -1; // pid와 일치하는 프로세스가 없으면 -1 반환
 }
 
+static void
+pad_str(const char *str, int width)
+{
+  int len = strlen(str);
+  printf("%s", str);
+  for (int i = len; i < width; i++) {
+    printf(" ");
+  }
+}
+
+static void
+pad_int(uint64 num, int width)
+{
+  printf("%lu", num);
+  int len = 0;
+  uint64 temp = num;
+  do {
+    len++;
+    temp /= 10;
+  } while(temp > 0);
+  for (int i = len; i < width; i++) {
+    printf(" ");
+  }
+}
+
 void
 ps(int pid)
 {
@@ -742,7 +912,18 @@ ps(int pid)
   char *state;
 
   if (pid == 0) { // 모든 프로세스의 정보 출력
-    printf("name        pid   state       priority\n"); // 공백 12, 6, 12
+    pad_str("name", 12);
+    pad_str("pid", 6);
+    pad_str("state", 12);
+    pad_str("priority", 12);
+    pad_str("runtime/weight", 16);
+    pad_str("runtime", 12);
+    pad_str("vruntime", 12);
+    pad_str("vdeadline", 12);
+    pad_str("is_eligible", 16);
+    printf("tick ");
+    uint64 total_tick = ticks * 1000ULL;
+    printf("%lu\n", total_tick);
     for (p = proc; p < &proc[NPROC]; p++) {
       if (p->state != UNUSED) {
         switch (p->state) { // case 0: UNUSED 일 경우는 없으니 제외
@@ -753,27 +934,22 @@ ps(int pid)
           case 5: state = "ZOMBIE"; break;
           default: state = "???"; break;
         }
-        printf("%s", p->name);
-        for (int i = strlen(p->name); i < 12; i++) {
-          printf(" ");
-        }
-        // pid 출력 및 공백 처리
-        int pid_spaces = 6;  // pid 영역 전체 길이
-        int pid_len = 1;     // pid 자릿수 계산
-        int temp_pid = p->pid;
-        while (temp_pid >= 10) {
-          pid_len++;
-          temp_pid /= 10;
-        }
-        printf("%d", p->pid);
-        for (int i = pid_len; i < pid_spaces; i++) {
-          printf(" ");
-        }
-        printf("%s", state);
-        for(int i = strlen(state); i < 12; i++) {
-          printf(" ");
-        }
-        printf("%d\n", p->nice);
+        uint64 runtime = p->runtime * 1000ULL;
+        uint64 runperwei = runtime / p->weight;
+        uint64 vruntime = p->vruntime * 1000ULL;
+        uint64 vdeadline = p->vdeadline * 1000ULL;
+        char *eligibility = is_eligible(p) ? "true" : "false";
+
+        pad_str(p->name, 12);
+        pad_int(p->pid, 6);
+        pad_str(state, 12);
+        pad_int(p->nice, 12);
+        pad_int(runperwei, 16);
+        pad_int(runtime, 12);
+        pad_int(vruntime, 12);
+        pad_int(vdeadline, 12);
+        pad_str(eligibility, 16);
+        printf("\n");
       }
     }
   }
@@ -781,7 +957,18 @@ ps(int pid)
   else { // 해당하는 프로세스의 정보만 출력하거나 없으면 아무것도 출력하지 않음
     for (p = proc; p < &proc[NPROC]; p++) {
       if (p->pid == pid && p->state != UNUSED) {
-        printf("name        pid   state       priority\n"); // 공백 12, 6, 12
+        pad_str("name", 12);
+        pad_str("pid", 6);
+        pad_str("state", 12);
+        pad_str("priority", 12);
+        pad_str("runtime/weight", 16);
+        pad_str("runtime", 12);
+        pad_str("vruntime", 12);
+        pad_str("vdeadline", 12);
+        pad_str("is_eligible", 16);
+        printf("tick ");
+        uint64 total_tick = ticks * 1000ULL;
+        printf("%lu\n", total_tick);
         switch (p->state) {
           case 1: state = "USED"; break;
           case 2: state = "SLEEPING"; break;
@@ -790,28 +977,22 @@ ps(int pid)
           case 5: state = "ZOMBIE"; break;
           default: state = "???"; break;
         }
-        printf("%s", p->name);
-        for (int i = strlen(p->name); i < 12; i++) {
-          printf(" ");
-        }
-        // pid 출력 및 공백 처리
-        int pid_spaces = 6;  // pid 영역 전체 길이
-        int pid_len = 1;     // pid 자릿수 계산
-        int temp_pid = p->pid;
-        while (temp_pid >= 10) {
-          pid_len++;
-          temp_pid /= 10;
-        }
-        printf("%d", p->pid);
-        for (int i = pid_len; i < pid_spaces; i++) {
-          printf(" ");
-        }
-        printf("%s", state);
-        for(int i = strlen(state); i < 12; i++) {
-          printf(" ");
-        }
-        printf("%d\n", p->nice);
-        break;
+        uint64 runtime = p->runtime * 1000ULL;
+        uint64 runperwei = runtime / p->weight;
+        uint64 vruntime = p->vruntime * 1000ULL;
+        uint64 vdeadline = p->vdeadline * 1000ULL;
+        char *eligibility = is_eligible(p) ? "true" : "false";
+
+        pad_str(p->name, 12);
+        pad_int(p->pid, 6);
+        pad_str(state, 12);
+        pad_int(p->nice, 12);
+        pad_int(runperwei, 16);
+        pad_int(runtime, 12);
+        pad_int(vruntime, 12);
+        pad_int(vdeadline, 12);
+        pad_str(eligibility, 16);
+        printf("\n");
       }
     }
   }

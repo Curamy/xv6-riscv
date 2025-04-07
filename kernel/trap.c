@@ -170,10 +170,22 @@ clockintr()
     release(&tickslock);
   }
 
+  struct proc *p = myproc();
+  if (p != 0 && p->state == RUNNING) {
+
+    p->runtime++;
+    p->vruntime += (weight[DEFAULT_NICE] * 1) / p->weight;
+    p->timeslice--;
+
+    if (p->timeslice <= 0) {  // time slice expired
+      yield();
+    }
+  }
+
   // ask for the next timer interrupt. this also clears
   // the interrupt request. 1000000 is about a tenth
   // of a second.
-  w_stimecmp(r_time() + 1000000);
+  w_stimecmp(r_time() + 100000);
 }
 
 // check if it's an external interrupt or software interrupt,

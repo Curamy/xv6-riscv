@@ -27,6 +27,7 @@ struct cpu {
 };
 
 extern struct cpu cpus[NCPU];
+extern const uint64 weight[];
 
 // per-process data for the trap handling code in trampoline.S.
 // sits in a page by itself just under the trampoline page in the
@@ -82,6 +83,7 @@ struct trapframe {
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 #define DEFAULT_NICE 20 // 초기 nice 값 20으로 설정
+#define DEFAULT_TIME_SLICE 5 // time slice 값 5로 설정
 
 // Per-process state
 struct proc {
@@ -107,4 +109,9 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
   int nice;
+  uint64 weight;
+  uint64 vruntime;
+  uint64 vdeadline;
+  uint64 runtime;
+  int timeslice;
 };
