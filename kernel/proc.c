@@ -585,6 +585,8 @@ scheduler(void)
     // processes are waiting.
     intr_on();
 
+    rq_init();
+
     uint64 min_vdeadline = (uint64)-1; //UINT64_MAX
     struct proc *selected_p = 0;
 
