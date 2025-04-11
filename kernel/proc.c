@@ -932,10 +932,10 @@ ps(int pid)
           case 5: state = "ZOMBIE"; break;
           default: state = "???"; break;
         }
-        uint64 runtime = p->runtime * 1000ULL;
+        uint64 runtime = p->runtime;
         uint64 runperwei = runtime / p->weight;
-        uint64 vruntime = p->vruntime * 1000ULL;
-        uint64 vdeadline = p->vdeadline * 1000ULL;
+        uint64 vruntime = p->vruntime;
+        uint64 vdeadline = p->vdeadline;
         char *eligibility = is_eligible(p) ? "true" : "false";
 
         pad_str(p->name, 12);
@@ -975,10 +975,10 @@ ps(int pid)
           case 5: state = "ZOMBIE"; break;
           default: state = "???"; break;
         }
-        uint64 runtime = p->runtime * 1000ULL;
+        uint64 runtime = p->runtime;
         uint64 runperwei = runtime / p->weight;
-        uint64 vruntime = p->vruntime * 1000ULL;
-        uint64 vdeadline = p->vdeadline * 1000ULL;
+        uint64 vruntime = p->vruntime;
+        uint64 vdeadline = p->vdeadline;
         char *eligibility = is_eligible(p) ? "true" : "false";
 
         pad_str(p->name, 12);

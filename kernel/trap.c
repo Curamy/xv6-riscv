@@ -173,9 +173,9 @@ clockintr()
   struct proc *p = myproc();
   if (p != 0 && p->state == RUNNING) {
 
-    p->runtime++;
-    p->vruntime += (weight[DEFAULT_NICE] * 1) / p->weight;
-    p->timeslice--;
+    p->runtime += MILLITICK;
+    p->vruntime += (weight[DEFAULT_NICE] * MILLITICK) / p->weight;
+    p->timeslice -= MILLITICK;
 
     if (p->timeslice <= 0) {  // time slice expired
       yield();

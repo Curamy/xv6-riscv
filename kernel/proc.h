@@ -83,7 +83,8 @@ struct trapframe {
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 #define DEFAULT_NICE 20 // 초기 nice 값 20으로 설정
-#define DEFAULT_TIME_SLICE 5 // time slice 값 5로 설정
+#define DEFAULT_TIME_SLICE 5000 // time slice 값 5 * 1000 으로 설정
+#define MILLITICK 1000 // 1 tick = 1000 ms
 
 // Per-process state
 struct proc {
