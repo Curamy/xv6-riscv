@@ -2,52 +2,51 @@
 #include "kernel/stat.h"
 #include "user/user.h"
 
-#define NCHILD 3
+#define N 10  // 총 10개 프로세스
 
-// 5. sleep / wake-up 시나리오
-// 상황: 프로세스 여러 개 중 일부가 sleep()으로 잠들었다가 나중에 wake-up()되는 케이스
+// 9. 극단적 케이스(여러 개 프로세스, nice 차이 큰 경우)
+// 상황:
+
+// 프로세스 수가 꽤 많고(10개 이상), nice=0부터 nice=39까지 극단적 차이
 
 // 목표:
 
-// 잠든 동안에는 스케줄링에서 제외되므로, 깨어날 때 vdeadline, time slice가 재설정
+// 매우 높은 우선순위 프로세스가 압도적으로 CPU를 차지하는지
 
-// 깨어난 프로세스가 vdeadline이 매우 작아지거나(우선 실행) 하는 문제 없이,
-// “현 시점에서” 다시 eligibility를 판정받는지
+// 매우 낮은 우선순위 프로세스가 거의 실행되지 않고 밀리지만, 그래도 eligibility가 생기면 조금씩은 실행되는지
 
 // 확인 포인트:
 
-// “DO NOT call sched() during a wake-up” → 현재 실행 중인 프로세스의 time slice가 끝나기 전까지는 문맥 전환 X
+// runtime이 거의 90% 이상 하나의 프로세스가 차지하는지, 나머지는 조금씩만 돌아가는지
 
-// wake-up 시 ps()를 찍어 eligibility가 잘 반영되는지
+int
+main(void)
+{
+  int i;
+  int base_nice = 0;
+  int pids[N];
 
+  printf("[TEST9] 극단적인 nice 차이 시나리오 시작\n");
 
-int main(void) {
-  int pids[NCHILD];
-
-  printf("[TEST5] sleep/wakeup 시나리오 테스트 시작\n");
-
-  // 1. 자식 프로세스 생성
-  for (int i = 0; i < NCHILD; i++) {
+  // 자식 프로세스 N개 생성
+  for (i = 0; i < N; i++) {
     int pid = fork();
     if (pid < 0) {
-      printf("fork 실패\n");
+      printf("fork failed\n");
       exit(1);
     }
     if (pid == 0) {
-      int id = i;
-      if (id == 1) {
-        // 자식 1: sleep했다가 깨어남
-        printf("[Child %d] sleep 시작 (tick= %d)\n", id, uptime());
-        sleep(300);  // 충분히 잠들기
-        printf("[Child %d] 깨어남 (tick= %d)\n", id, uptime());
-      }
-
-      // Busy-loop
+      int mypid = getpid();
+      printf("[Child %d] 시작 (PID: %d)\n", i, mypid);
+      // 각 프로세스는 무한 루프로 busy waiting
       volatile unsigned long x = 0;
       while (1) {
-        for (int j = 0; j < 10000000; j++)
+        for (int j = 0; j < 10000000; j++) {
           x += j;
-        sleep(1); // 짧은 대기
+        }
+        // 간헐적으로 ps 출력
+        if (i == 0) ps(0);  // 우선순위 가장 높은 프로세스만 ps 호출
+        sleep(10);
       }
       exit(0);
     } else {
@@ -55,24 +54,20 @@ int main(void) {
     }
   }
 
-  // nice 값 설정
-  for (int i = 0; i < NCHILD; i++) {
-    setnice(pids[i], 20);
+  // 각 프로세스에 극단적인 nice 값을 부여 (0 ~ 39)
+  for (i = 0; i < N; i++) {
+    setnice(pids[i], base_nice + i * 4); // 0, 4, 8, ..., 36
   }
 
-  // 2. 부모는 ps() 반복 호출
-  for (int k = 0; k < 12; k++) {
-    printf("\n[Parent] ====== ps 호출 (iteration %d) ======\n", k);
-    ps(0);
-    sleep(100);  // 100 tick 동안 대기
-  }
+  // 부모는 관찰만
+  sleep(500); // 충분한 시간 실행되도록 대기
 
-  // 3. 종료
-  for (int i = 0; i < NCHILD; i++) {
+  // 종료 처리
+  for (i = 0; i < N; i++) {
     kill(pids[i]);
     wait(0);
   }
 
-  printf("[TEST5] 테스트 종료\n");
+  printf("[TEST9] 테스트 종료\n");
   exit(0);
 }

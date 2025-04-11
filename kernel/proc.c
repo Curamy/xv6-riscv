@@ -118,7 +118,6 @@ rq_remove(struct proc *p)
   release(&rq_lock);
 }
 
-//  부팅 완료 후 1회만 연산
 static void
 rq_init(void)
 {
@@ -369,7 +368,6 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-  rq_add(p); // run queue에 추가
 
   release(&p->lock);
 
@@ -606,7 +604,6 @@ scheduler(void)
     }
     
     if (selected_p) {
-      rq_remove(selected_p); // run queue에서 제거
       selected_p->state = RUNNING;
       selected_p->timeslice = DEFAULT_TIME_SLICE;
       c->proc = selected_p;
@@ -657,7 +654,6 @@ yield(void)
   acquire(&p->lock);
   p->state = RUNNABLE;
   p->vdeadline = p->vruntime + (weight[DEFAULT_NICE] * DEFAULT_TIME_SLICE) / p->weight;
-  rq_add(p); // run queue에 다시 추가
   sched();
   release(&p->lock);
 }
