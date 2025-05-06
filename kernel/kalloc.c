@@ -9,6 +9,8 @@
 #include "riscv.h"
 #include "defs.h"
 
+int free_pages_count = 0; // 사용 가능한 페이지 수
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -59,6 +61,7 @@ kfree(void *pa)
   acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
+  free_pages_count++;
   release(&kmem.lock);
 }
 
@@ -72,8 +75,10 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
     kmem.freelist = r->next;
+    free_pages_count--;
+  }
   release(&kmem.lock);
 
   if(r)
@@ -97,4 +102,10 @@ getfreemem(void)
   release(&kmem.lock);
 
   return free_pages * PGSIZE; // byte 단위 (*4096)
+}
+
+int
+getfreepagescount(void)
+{
+  return free_pages_count;
 }

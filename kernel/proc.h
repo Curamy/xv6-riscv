@@ -86,6 +86,17 @@ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 #define DEFAULT_TIME_SLICE 5000 // time slice 값 5 * 1000 으로 설정
 #define MILLITICK 1000 // 1 tick = 1000 ms
 
+struct mmap_area {
+  struct file *f;
+  uint64 addr;
+  int length;
+  int offset;
+  int prot;
+  int flags;
+  struct proc *p;
+  int used;
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;

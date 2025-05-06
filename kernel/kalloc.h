@@ -18,5 +18,6 @@ void kinit(void);
 void* kalloc(void);
 void kfree(void*);
 uint64 getfreemem(void);  // 사용 가능한 메모리 크기 반환
+int getfreepagescount(void); // 사용 가능한 페이지 수 반환
 
 #endif // _KALLOC_H_ 

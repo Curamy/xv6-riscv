@@ -67,7 +67,17 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  }
+  
+  // page fault handler 추가
+  else if (r_scause() == 13 || r_scause() == 15) {
+    if (pf_handler(r_stval(), r_scause()) == -1) {
+      printf("page fault handler failed\n");
+      setkilled(p);
+    }
+  }
+  
+  else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);

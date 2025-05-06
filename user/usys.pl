@@ -42,3 +42,6 @@ entry("ps");
 entry("meminfo");
 entry("waitpid");
 entry("getpname");
+entry("mmap");
+entry("munmap");
+entry("freemem");

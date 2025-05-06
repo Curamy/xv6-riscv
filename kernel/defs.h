@@ -112,6 +112,10 @@ void ps(int pid);
 uint64 meminfo(void);
 int waitpid(int pid);
 void getpname(int pid);
+uint64 mmap(uint64 addr, int length, int prot, int flags, int fd, int offset);
+int pf_handler(uint64 va, uint64 scause);
+int munmap(uint64 addr);
+int freemem(void);
 
 // swtch.S
 void            swtch(struct context*, struct context*);

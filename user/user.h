@@ -28,6 +28,9 @@ void ps(int pid);
 uint64 meminfo(void);
 int waitpid(int pid);
 void getpname(int);
+uint64 mmap(uint64 addr, int length, int prot, int flags, int fd, int offset);
+int munmap(uint64 addr);
+int freemem(void);
 
 // ulib.c
 int stat(const char*, struct stat*);

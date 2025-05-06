@@ -6,6 +6,10 @@
 #include "proc.h"
 #include "defs.h"
 #include "kalloc.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+
 const uint64 weight[40] = {
   88761, 71755, 56483, 46273, 36291,
   29154, 23254, 18705, 14949, 11916,
@@ -16,6 +20,8 @@ const uint64 weight[40] = {
   110, 87, 70, 56, 45,
   36, 29, 23, 18, 15
 };
+
+struct mmap_area mmap_areas[MMAPSIZE];
 
 struct spinlock rq_lock;
 uint64 rq_weighted_diff = 0;  // sigma((vi - v0) * wi)
@@ -167,6 +173,8 @@ procinit(void)
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
   }
+
+  memset(mmap_areas, 0, sizeof(mmap_areas)); // mmap_area 초기화
 }
 
 // Must be called with interrupts disabled,
@@ -430,6 +438,65 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  // mmap_area 복사
+  for (i = 0; i < MMAPSIZE; i++) {
+    struct mmap_area *parent_ma = &mmap_areas[i];
+    if (parent_ma->used && parent_ma->p == p) {
+      int j = 0;
+      for (; j < MMAPSIZE; j++) {
+        if (mmap_areas[j].used == 0) {
+          break;
+        }
+      }
+        
+      if (j == MMAPSIZE) {
+        freeproc(np);
+        release(&np->lock);
+        return -1;
+      }
+
+      struct mmap_area *child_ma = &mmap_areas[j];
+      *child_ma = *parent_ma;
+      child_ma->p = np;
+
+      if (!(child_ma->flags & MAP_ANONYMOUS) && child_ma->f) {
+        child_ma->f = filedup(child_ma->f);
+      }
+
+      // 물리 페이지 복사
+      for (uint64 va = child_ma->addr; va < child_ma->addr + child_ma->length; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+        if (pte == 0 || (*pte & PTE_V) == 0) { // PTE가 없거나 유효하지 않은 경우
+          continue;
+        }
+
+        uint64 pa = PTE2PA(*pte);
+        if (pa == 0) {
+          continue;
+        }
+
+        char *mem = kalloc();
+        if (mem == 0) {
+          mmap_areas[j].used = 0;
+          freeproc(np);
+          release(&np->lock);
+          return -1;
+        }
+
+        memmove(mem, (char *)pa, PGSIZE);
+
+        int perm = PTE_FLAGS(*pte) & (PTE_R | PTE_W | PTE_X | PTE_U);
+        if (mappages(np->pagetable, va, PGSIZE, (uint64)mem, perm) < 0) {
+          kfree(mem);
+          mmap_areas[j].used = 0;
+          freeproc(np);
+          release(&np->lock);
+          return -1;
+        }
+      }
+    }
+  }
+
   pid = np->pid;
 
   release(&np->lock);
@@ -485,6 +552,14 @@ exit(int status)
       struct file *f = p->ofile[fd];
       fileclose(f);
       p->ofile[fd] = 0;
+    }
+  }
+
+  // mmap_area 해제
+  for (int i = 0; i < MMAPSIZE; i++) {
+    struct mmap_area *ma = &mmap_areas[i];
+    if (ma->used && ma->p == p) {
+      munmap(ma->addr);
     }
   }
 
@@ -1053,4 +1128,204 @@ getpname(int pid)
     }
     release(&p->lock);
   }
+}
+
+uint64 mmap(uint64 addr, int length, int prot, int flags, int fd, int offset)
+{
+  struct proc *p = myproc();
+  struct file *f = 0;
+
+  if (addr % PGSIZE != 0 || length % PGSIZE != 0) {
+    return 0;
+  }
+
+  int is_anonymous = (flags & MAP_ANONYMOUS);
+  if (is_anonymous) { // anonymous mapping -> 파일 X, 전부 0으로 초기화
+    if (fd != -1 || offset != 0) {
+      return 0;
+    }
+  }
+  else { // 파일 mapping
+    if (fd < 0 || fd >= NOFILE) {
+      return 0;
+    }
+    f = p->ofile[fd];
+    if (f == 0) {
+      return 0;
+    }
+    if ((prot & PROT_READ) && !(f->readable)) {
+      return 0;
+    }
+    if ((prot & PROT_WRITE) && !(f->writable)) {
+      return 0;
+    }
+  }
+
+  int i = 0;
+  for (; i < MMAPSIZE; i++) {
+    if (!mmap_areas[i].used) {
+      break;
+    }
+  }
+  if (i == MMAPSIZE) {
+    return 0;
+  }
+
+  uint64 start_addr = MMAPBASE + addr;
+
+  mmap_areas[i].addr = start_addr;
+  mmap_areas[i].length = length;
+  mmap_areas[i].offset = offset;
+  mmap_areas[i].prot = prot;
+  mmap_areas[i].flags = flags;
+  mmap_areas[i].p = p;
+  mmap_areas[i].used = 1;
+  mmap_areas[i].f = 0;
+
+  if (!is_anonymous) {
+    mmap_areas[i].f = filedup(f);
+  }
+
+  if (flags & MAP_POPULATE) { // POPULATE일 경우 물리 페이지 할당 및 Page Table Mapping까지
+    for (uint64 va = start_addr; va < start_addr + length; va += PGSIZE) {
+      char *mem = kalloc();
+      if (mem == 0) {
+        mmap_areas[i].used = 0;
+        return 0;
+      }
+      memset(mem, 0, PGSIZE);
+
+      if (!is_anonymous) {
+        uint64 read_offset = offset + (va - start_addr);
+        readi(f->ip, 0, (uint64)mem, read_offset, PGSIZE);
+      }
+
+      int perm = PTE_U;
+      if (prot & PROT_READ) {
+        perm |= PTE_R;
+      }
+      if (prot & PROT_WRITE) {
+        perm |= PTE_W;
+      }
+
+      if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) < 0) {
+        kfree(mem);
+        mmap_areas[i].used = 0;
+        return 0;
+      }
+    }
+  }
+
+  return start_addr; // 시작 주소 반환
+}
+
+int pf_handler(uint64 va, uint64 scause)
+{
+  struct proc *p = myproc();
+  va = PGROUNDDOWN(va);
+
+  for (int i = 0; i < MMAPSIZE; i++) {
+    struct mmap_area *ma = &mmap_areas[i];
+
+    if (!ma->used || ma->p != p) {
+      continue;
+    }
+    if (va < ma->addr || va >= ma->addr + ma->length) {
+      continue;
+    }
+
+    if (scause == 13 && !(ma->prot & PROT_READ)) {
+      return -1;
+    }
+    if (scause == 15 && !(ma->prot & PROT_WRITE)) {
+      return -1;
+    }
+
+    char *mem = kalloc();
+    if (mem == 0) {
+      return -1;
+    }
+    memset(mem, 0, PGSIZE);
+
+    if (!(ma->flags & MAP_ANONYMOUS)) { // 파일 매핑인 경우
+      uint64 read_offset = ma->offset + (va - ma->addr);
+      readi(ma->f->ip, 0, (uint64)mem, read_offset, PGSIZE);
+    }
+
+    int perm = PTE_U;
+    if (ma->prot & PROT_READ) {
+      perm |= PTE_R;
+    }
+    if (ma->prot & PROT_WRITE) {
+      perm |= PTE_W;
+    }
+
+    if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) < 0) {
+      kfree(mem);
+      return -1;
+    }
+
+    return 1; // 페이지 할당 성공
+  }
+
+  return -1; // mmap 영역이 아닌 경우
+}
+
+int munmap(uint64 addr)
+{
+  struct proc *p = myproc();
+
+  if (addr % PGSIZE != 0) {
+    return 0;
+  }
+
+  for (int i = 0; i < MMAPSIZE; i++) {
+    struct mmap_area *ma = &mmap_areas[i];
+
+    if (!ma->used || ma->p != p) {
+      continue;
+    }
+
+    if (ma->addr == addr) {
+      for (uint64 va = ma->addr; va < ma->addr + ma->length; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+
+        if (pte == 0 || (*pte & PTE_V) == 0) { // PTE가 없거나 유효하지 않은 경우
+          continue;
+        }
+
+        uint64 pa = PTE2PA(*pte);
+        if (pa == 0) {
+          continue;
+        }
+
+        char *mem = (char *)pa;
+        memset(mem, 1, PGSIZE);
+        uvmunmap(p->pagetable, va, 1, 1);
+      }
+
+      if (!(ma->flags & MAP_ANONYMOUS) && ma->f) { // 파일 매핑인 경우
+        fileclose(ma->f);
+      }
+
+      // mmap_area structure 제거
+      ma->f = 0;
+      ma->addr = 0;
+      ma->length = 0;
+      ma->offset = 0;
+      ma->prot = 0;
+      ma->flags = 0;
+      ma->p = 0;
+      ma->used = 0;
+
+      return 1;
+    }
+  }
+
+  return -1;
+}
+
+int freemem(void)
+{
+  return getfreepagescount();
 }
